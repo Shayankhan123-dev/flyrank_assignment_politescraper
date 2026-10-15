@@ -3,6 +3,7 @@ import time
 import requests
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
+from datetime import datetime, timezone
 
 CACHE_DIR = "cache"
 HEADERS = {
@@ -38,9 +39,9 @@ def get_html(url, filename):
 def discover_books():
     current_url = "https://books.toscrape.com/catalogue/page-1.html"
     catalogue_pages = 0
-    discovered_links = []
+    # Using a dictionary to map absolute URL -> source catalogue page
+    discovered_links = {} 
     
-    # Stop after 3 pages or if there is no next page
     while current_url and catalogue_pages < 3:
         catalogue_pages += 1
         filename = f"catalogue-page-{catalogue_pages}.html"
@@ -49,35 +50,87 @@ def discover_books():
         if not html:
             break
             
-        # Wait 0.5s between real requests[cite: 4]
         if not from_cache:
             time.sleep(0.5) 
             
         soup = BeautifulSoup(html, "html.parser")
         
-        # Collect the link to every book on the page[cite: 4]
         for article in soup.select("article.product_pod"):
             a_tag = article.select_one("h3 a")
             if a_tag and "href" in a_tag.attrs:
-                # Turn relative URLs into absolute URLs[cite: 4]
                 abs_url = urljoin(current_url, a_tag["href"])
-                discovered_links.append(abs_url)
+                if abs_url not in discovered_links:
+                    discovered_links[abs_url] = current_url
         
-        # Follow the catalogue's own "next" link[cite: 4]
         next_button = soup.select_one("li.next a")
         if next_button and catalogue_pages < 3:
             current_url = urljoin(current_url, next_button["href"])
         else:
             current_url = None
             
-    # Remove duplicate links[cite: 4]
-    unique_urls = list(set(discovered_links))
+    return discovered_links
+
+def extract_book_details(book_url, source_page):
+    """Fetches a single book page and extracts the raw record"""
+    # Create a safe, unique filename for the cache based on the URL ending
+    cache_filename = f"book-{book_url.rstrip('/').split('/')[-1]}"
+    if not cache_filename.endswith(".html"):
+        cache_filename += ".html"
+        
+    html, from_cache = get_html(book_url, cache_filename)
+    if not html:
+        return None
+        
+    if not from_cache:
+        time.sleep(0.5)
+        
+    soup = BeautifulSoup(html, "html.parser")
     
-    print(f"catalogue_pages = {catalogue_pages}")
-    print(f"discovered = {len(discovered_links)}")
-    print(f"unique_urls = {len(unique_urls)}")
+    # Aim selectors directly at the product area
+    product_main = soup.select_one("div.product_main")
+    if not product_main:
+        return None
+        
+    title_elem = product_main.select_one("h1")
+    price_elem = product_main.select_one("p.price_color")
+    availability_elem = product_main.select_one("p.instock.availability")
     
-    return unique_urls
+    # The rating is stored as the second class name in the star-rating paragraph
+    rating_elem = product_main.select_one("p.star-rating")
+    rating_text = rating_elem["class"][1] if rating_elem and len(rating_elem["class"]) > 1 else None
+    
+    # The description is the next sibling paragraph after the #product_description div
+    desc_heading = soup.select_one("#product_description")
+    desc_elem = desc_heading.find_next_sibling("p") if desc_heading else None
+    
+    # Build the 8-field raw record keeping source_page and fetched_at as provenance
+    return {
+        "title": title_elem.text if title_elem else None,
+        "product_url": book_url,
+        "price_text": price_elem.text if price_elem else None,
+        "availability_text": availability_elem.text.strip() if availability_elem else None,
+        "rating_text": rating_text,
+        "description": desc_elem.text if desc_elem else None,  # Will correctly be None if missing[cite: 4]
+        "source_page": source_page,
+        "fetched_at": datetime.now(timezone.utc).isoformat()
+    }
 
 if __name__ == "__main__":
-    discover_books()
+    book_links = discover_books()
+    
+    raw_records = []
+    print("Extracting book details... (this will take ~30 seconds on the first run)")
+    
+    for url, source in book_links.items():
+        record = extract_book_details(url, source)
+        if record:
+            raw_records.append(record)
+            
+    # Stage 3 Checkpoint: Print one complete record and the total count[cite: 4]
+    if raw_records:
+        import json
+        print("\n--- SAMPLE RECORD ---")
+        print(json.dumps(raw_records[0], indent=2))
+        print("---------------------\n")
+        
+    print(f"detail_pages = {len(raw_records)}")
